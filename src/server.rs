@@ -1,72 +1,106 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
+
 use std::error::Error;
 use std::sync::{Arc, Mutex};
-
+use std::collections::HashMap;
+use tokio::sync::{mpsc};
+use tokio::select;
+use std::ops::Deref;
 
 struct ChatServer{
     listener: TcpListener,
-    clients: Arc<Mutex<Vec<TcpStream>>>
 }
+
 
 struct Client{
     socket: TcpStream,
-    clients: Arc<Mutex<Vec<TcpStream>>>
+    rx : mpsc::Receiver<Vec<u8>>,
+    clients_tx: Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>,
+    address: SocketAddr
 }
 
 impl Client{
 
-    async fn handle_client(&mut self)
+    async fn handle_client(&'static mut self) -> Result<(), Box<dyn Error>>
     {
-        let mut buf = vec![0; 1024];
-
         
         // In a loop, read data from the socket and write the data back.
         loop {
+            let mut buf = vec![0; 1024];
+
             let n = self.socket
                 .read(&mut buf)
-                .await
-                .expect("failed to read data from socket");
-
+                .await?;
+            
             if n == 0 {
-                return;
+                return Ok(());
+            }
+            
+            {
+                for (addr, tx) in self.clients_tx.lock()?.deref()
+                {
+                    if *addr != self.address{
+                        tx.send(buf.clone());
+                    } 
+                }
+                
             }
 
+            //TODO THATSS BAD :) ITs not error if all the clients exist.
+            //TODO what happens if client exist? who cleans its state?
+            let received_string = self.rx.recv().await.unwrap_or(
+            {
+                return Err("Channel closed".into());
+            });
+            
             self.socket
-                .write_all(&buf[0..n])
-                .await
-                .expect("failed to write data to socket");
+                .write_all(&received_string)
+                .await?;
         }
     }
 
 }
 
+struct ChatMessage{
+    message: String,
+    source: String
+}
 impl ChatServer{
 
     async fn init() -> Result<ChatServer, Box<dyn Error>>
     {
         let listener = TcpListener::bind("127.0.0.1:8080".to_string()).await?; 
-        let clients = Arc::new(Mutex::new(Vec::new()));
         let chat = ChatServer{
-            listener,
-            clients};
+            listener};
         Ok(chat)
     }
 
     async fn run(&self) -> Result<(), Box<dyn Error>>
     {
+        
+        let clients_tx = Arc::new(Mutex::new(HashMap::new()));
+        
         loop {
             // Asynchronously wait for an inbound socket.
+            
+            let (socket, address) = self.listener.accept().await?;
+            
+            let (tx, rx) = mpsc::channel::<Vec<u8>>(10);
+            
+            clients_tx.lock().unwrap().insert(address, tx);
+            
 
-            let (socket, _) = self.listener.accept().await?;
-
-            let clients = Arc::clone(&self.clients);
             let mut client = Client{
                 socket,
-                clients
+                rx,
+                clients_tx: clients_tx.clone(),
+                address
             };
 
             tokio::spawn(async move{
+                    let mut client = client;
                     client.handle_client().await;
                 }
             );
