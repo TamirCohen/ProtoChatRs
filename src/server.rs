@@ -1,12 +1,11 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
-
+use tokio::sync::{mpsc, Mutex};
+use std::net::SocketAddr;
 use std::error::Error;
 use std::sync::{Arc};
 use std::collections::HashMap;
-use tokio::sync::{mpsc, Mutex};
-use futures::executor; 
+use futures::{future::FutureExt, select, executor};
 
 struct ChatServer{
     listener: TcpListener,
@@ -39,40 +38,60 @@ impl Client{
 
     }
 
+    async fn read_from_socket(socket: &mut TcpStream) -> Result<Option<Vec::<u8>>, Box<dyn Error>>
+    {
+        let mut buf = vec![0; 1024];
+
+        let n = socket
+            .read(&mut buf)
+            .await?;
+        
+        if n == 0 {
+            return Ok(None);
+        }
+        
+        Ok(Some(buf))
+    }
+    
+    async fn broadcast_message(&self, buf: Vec::<u8>) -> Result<(), Box<dyn Error>>
+    {
+        for (addr, tx) in self.clients_tx.lock().await.iter_mut()
+        {
+            if *addr != self.address{
+                tx.send(buf.clone()).await?;
+            } 
+        }
+        Ok(())
+    }
+
+    async fn read_from_pipe(rx: &mut mpsc::Receiver<Vec<u8>>) -> Result< Vec::<u8>, Box<dyn Error>>
+    {
+        Ok(rx.recv().await.unwrap())
+    }
+
     async fn handle_client(mut self) -> Result<(), Box<dyn Error>>
     {
-        
-        // In a loop, read data from the socket and write the data back.
-        loop {
-            let mut buf = vec![0; 1024];
+        //TODO remove this idiotic block_on. It is just sync code in that way (NOOB MOVE TAMIR)
 
-            let n = self.socket
-                .read(&mut buf)
-                .await?;
-            
-            if n == 0 {
-                return Ok(());
-            }
-            
-            {
-                for (addr, tx) in self.clients_tx.lock().await.iter_mut()
-                   {
-                       if *addr != self.address{
-                           tx.send(buf.clone()).await?;
-                       } 
-                   }
+        //TODO handle all those errors, remove those hacky unwrap()
+        loop
+        {
+            select! {
+                received_from_client = Client::read_from_socket(&mut self.socket).fuse() =>{
+                {
+                    executor::block_on(self.broadcast_message(received_from_client.unwrap().unwrap()))?;
+                }}
 
-            }   
-
-            //TODO THATSS BAD :) ITs not error if all the clients exist.
-            //TODO what happens if client exist? who cleans its state?
-            
-            let received_string = self.rx.recv().await.unwrap();
-            
-            self.socket
-                .write_all(&received_string)
-                .await?;
+                received_from_peer = Client::read_from_pipe(&mut self.rx).fuse() => {
+                    executor::block_on(
+                    self.socket
+                    .write_all(&received_from_peer.unwrap())
+                    )?;
+                }
+            };
         }
+
+        Ok(())
     }
 
 }
@@ -81,7 +100,6 @@ impl Drop for Client{
     
     fn drop(&mut self)
     {
-        // executor::block_on(self.clients_tx.lock().remove(&self.address));
         let mut guard = executor::block_on(self.clients_tx.lock());
         guard.remove(&self.address);
 
@@ -89,10 +107,6 @@ impl Drop for Client{
     }
 }
 
-struct ChatMessage{
-    message: String,
-    source: String
-}
 impl ChatServer{
 
     async fn init() -> Result<ChatServer, Box<dyn Error>>
