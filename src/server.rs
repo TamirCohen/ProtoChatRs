@@ -3,11 +3,10 @@ use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
 
 use std::error::Error;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc};
 use std::collections::HashMap;
-use tokio::sync::{mpsc};
-use tokio::select;
-use std::ops::Deref;
+use tokio::sync::{mpsc, Mutex};
+use futures::executor; 
 
 struct ChatServer{
     listener: TcpListener,
@@ -22,8 +21,25 @@ struct Client{
 }
 
 impl Client{
+    async fn new(socket: TcpStream,
+            rx: mpsc::Receiver<Vec<u8>>,
+            tx: mpsc::Sender<Vec<u8>>,
+            clients_tx: Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>,
+            address: SocketAddr
+        ) -> Client
+    {
+        clients_tx.lock().await.insert(address, tx);
+        
+        Client{
+            socket,
+            rx,
+            clients_tx: clients_tx.clone(),
+            address
+        }
 
-    async fn handle_client(&'static mut self) -> Result<(), Box<dyn Error>>
+    }
+
+    async fn handle_client(mut self) -> Result<(), Box<dyn Error>>
     {
         
         // In a loop, read data from the socket and write the data back.
@@ -39,21 +55,19 @@ impl Client{
             }
             
             {
-                for (addr, tx) in self.clients_tx.lock()?.deref()
-                {
-                    if *addr != self.address{
-                        tx.send(buf.clone());
-                    } 
-                }
-                
-            }
+                for (addr, tx) in self.clients_tx.lock().await.iter_mut()
+                   {
+                       if *addr != self.address{
+                           tx.send(buf.clone()).await?;
+                       } 
+                   }
+
+            }   
 
             //TODO THATSS BAD :) ITs not error if all the clients exist.
             //TODO what happens if client exist? who cleans its state?
-            let received_string = self.rx.recv().await.unwrap_or(
-            {
-                return Err("Channel closed".into());
-            });
+            
+            let received_string = self.rx.recv().await.unwrap();
             
             self.socket
                 .write_all(&received_string)
@@ -61,6 +75,18 @@ impl Client{
         }
     }
 
+}
+
+impl Drop for Client{
+    
+    fn drop(&mut self)
+    {
+        // executor::block_on(self.clients_tx.lock().remove(&self.address));
+        let mut guard = executor::block_on(self.clients_tx.lock());
+        guard.remove(&self.address);
+
+        println!("DROPPED CLIENT: {:?}", self.address)
+    }
 }
 
 struct ChatMessage{
@@ -89,19 +115,18 @@ impl ChatServer{
             
             let (tx, rx) = mpsc::channel::<Vec<u8>>(10);
             
-            clients_tx.lock().unwrap().insert(address, tx);
             
 
-            let mut client = Client{
+            let client = Client::new(
                 socket,
                 rx,
-                clients_tx: clients_tx.clone(),
+                tx,
+                clients_tx.clone(),
                 address
-            };
+            ).await;
 
             tokio::spawn(async move{
-                    let mut client = client;
-                    client.handle_client().await;
+                    Client::handle_client(client).await;
                 }
             );
         }

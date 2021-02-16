@@ -10,6 +10,7 @@ edition = "2018"
 tokio = {version = "1", features = ["full"] }
 protobuf = { version = "2"}
 tokio-util = {version = "0.6.3", features=["codec"]}
+futures = "0.3.12"
 
 [build-dependencies]
 protoc-rust = "2.0"
