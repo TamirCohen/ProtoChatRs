@@ -6,11 +6,16 @@ use std::error::Error;
 use std::sync::{Arc};
 use std::collections::HashMap;
 use futures::{future::FutureExt, select, executor};
+use protos::messages::ChatMessage;
+use protobuf::Message;
+
+mod protos{
+    pub mod messages;
+}
 
 struct ChatServer{
     listener: TcpListener,
 }
-
 
 struct Client{
     socket: TcpStream,
@@ -18,6 +23,14 @@ struct Client{
     clients_tx: Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>,
     address: SocketAddr
 }
+
+enum ClientError{
+    ReceiveError,
+    Disconnected,
+    ParseError
+}
+
+//TODO module it up
 
 impl Client{
     async fn new(socket: TcpStream,
@@ -38,23 +51,29 @@ impl Client{
 
     }
 
-    async fn read_from_socket(socket: &mut TcpStream) -> Result<Option<Vec::<u8>>, Box<dyn Error>>
+    async fn read_from_socket(socket: &mut TcpStream) -> Result<ChatMessage, ClientError>
     {
-        let mut buf = vec![0; 1024];
+        let mut recv_buf = vec![0; 1024];
 
-        let n = socket
-            .read(&mut buf)
-            .await?;
+        let recevied_length = socket
+            .read(&mut recv_buf)
+            .await
+            .map_err(|_| ClientError::ReceiveError)?;
         
-        if n == 0 {
-            return Ok(None);
+        if recevied_length == 0 {
+            return Err(ClientError::Disconnected);
         }
-        
-        Ok(Some(buf))
+
+        let recv_message: ChatMessage = protobuf::Message::parse_from_bytes(&recv_buf[..recevied_length]).
+            map_err(|_| ClientError::ParseError)?;
+        //TODO add tokio framing and stuff
+        Ok(recv_message)
     }
     
-    async fn broadcast_message(&self, buf: Vec::<u8>) -> Result<(), Box<dyn Error>>
+    async fn broadcast_message(&self, message: ChatMessage) -> Result<(), Box<dyn Error>>
     {
+        let buf: Vec<u8> = message.write_to_bytes().unwrap();
+
         for (addr, tx) in self.clients_tx.lock().await.iter_mut()
         {
             if *addr != self.address{
@@ -69,6 +88,16 @@ impl Client{
         Ok(rx.recv().await.unwrap())
     }
 
+    async fn handle_message(&self, message: ChatMessage) -> Result< (), Box<dyn Error>>
+    {
+        println!("RECEIVED MESSAGE {:?}", message);
+        if message.get_broadcast()
+        {
+            self.broadcast_message(message).await?;
+        }
+        Ok(())
+    }
+
     async fn handle_client(mut self) -> Result<(), Box<dyn Error>>
     {
         //TODO remove this idiotic block_on. It is just sync code in that way (NOOB MOVE TAMIR)
@@ -79,11 +108,12 @@ impl Client{
             select! {
                 received_from_client = Client::read_from_socket(&mut self.socket).fuse() =>{
                 {
-                    match received_from_client.unwrap()
+                    match received_from_client
                     {
-                        None => return Ok(()),
-                        Some(s) => executor::block_on(self.broadcast_message(s))?
-                     
+                        Err(ClientError::Disconnected) => return Ok(()),
+                        Err(ClientError::ParseError) => continue,
+                        Err(ClientError::ReceiveError) => panic!("Socket receive Error"),
+                        Ok(message) => executor::block_on(self.handle_message(message))?
                     }
                 }}
 
