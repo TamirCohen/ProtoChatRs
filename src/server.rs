@@ -79,7 +79,12 @@ impl Client{
             select! {
                 received_from_client = Client::read_from_socket(&mut self.socket).fuse() =>{
                 {
-                    executor::block_on(self.broadcast_message(received_from_client.unwrap().unwrap()))?;
+                    match received_from_client.unwrap()
+                    {
+                        None => return Ok(()),
+                        Some(s) => executor::block_on(self.broadcast_message(s))?
+                     
+                    }
                 }}
 
                 received_from_peer = Client::read_from_pipe(&mut self.rx).fuse() => {
@@ -91,7 +96,6 @@ impl Client{
             };
         }
 
-        Ok(())
     }
 
 }
@@ -140,7 +144,7 @@ impl ChatServer{
             ).await;
 
             tokio::spawn(async move{
-                    Client::handle_client(client).await;
+                    Client::handle_client(client).await.unwrap();
                 }
             );
         }
